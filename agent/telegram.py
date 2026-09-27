@@ -56,6 +56,20 @@ class Telegram:
     async def send_typing(self, chat_id: int) -> None:
         await self._call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
+    async def get_updates(self, offset: int, timeout: int = 30) -> list[dict[str, Any]]:
+        resp = await self.http.post(
+            f"{self.base}/getUpdates",
+            json={"offset": offset, "timeout": timeout, "allowed_updates": ["message", "callback_query"]},
+            timeout=timeout + 10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram getUpdates failed: {data}")
+        return data["result"]
+
+    async def delete_webhook(self) -> None:
+        await self._call("deleteWebhook", {})
+
     async def set_webhook(self, url: str, secret: str) -> None:
         await self._call(
             "setWebhook",

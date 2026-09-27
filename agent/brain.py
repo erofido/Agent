@@ -212,16 +212,20 @@ class Brain:
                 await self.tg.send_message(chat_id, reply)
 
     def _system_prompt(self) -> str:
-        return SYSTEM_PROMPT.format(
+        prompt = SYSTEM_PROMPT.format(
             owner_name=self.s.owner_name,
             owner_phone=self.s.owner_phone,
             memories="\n".join(f"- [{m['id']}] {m['text']}" for m in self.db.list_memories()) or "- (nothing yet)",
         )
+        if self.calls is None:
+            prompt += "\nNote: phone calls are not set up yet. If asked to call someone, say so and offer to help otherwise.\n"
+        return prompt
 
     def _tools(self) -> list[dict[str, Any]]:
+        tools = TOOLS if self.calls else [t for t in TOOLS if t["name"] != "place_call"]
         if self.backend.provider == "anthropic":
-            return TOOLS
-        return [*TOOLS, *([WEB_SEARCH_TOOL] if self.s.brave_api_key else []), FETCH_URL_TOOL]
+            return tools
+        return [*tools, *([WEB_SEARCH_TOOL] if self.s.brave_api_key else []), FETCH_URL_TOOL]
 
     def _tool_runner(self, chat_id: int):
         async def run(name: str, args: Any) -> tuple[str, bool]:
@@ -247,7 +251,8 @@ class Brain:
                 raise ValueError(f"'{a['to_number']}' is not an E.164 number like +905321234567")
             if number == self.s.owner_phone:
                 raise ValueError("That is the owner's own number")
-            assert self.calls is not None
+            if self.calls is None:
+                raise ValueError("Phone calls aren't set up yet (Twilio/Retell missing)")
             call_id = await self.calls.request_call(
                 chat_id, number, a["contact_name"], a["goal"], a["brief"], a["language"]
             )

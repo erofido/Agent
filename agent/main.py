@@ -37,10 +37,67 @@ class App:
         self.db = DB(settings.db_path)
         self.tg = Telegram(settings.telegram_bot_token)
         self.brain = Brain(settings, self.db, self.tg)
-        self.calls = CallManager(settings, self.db, self.tg, on_event=self.brain.handle_event)
-        self.brain.calls = self.calls
+        self.calls: CallManager | None = None
+        if settings.calls_enabled:
+            self.calls = CallManager(settings, self.db, self.tg, on_event=self.brain.handle_event)
+            self.brain.calls = self.calls
         self.twilio_validator = RequestValidator(settings.twilio_auth_token)
         self._tasks: set[asyncio.Task[Any]] = set()
+
+    def handle_update(self, update: dict[str, Any]) -> None:
+        """Route one Telegram update (from the webhook or from polling)."""
+        if cb := update.get("callback_query"):
+            if cb["from"]["id"] != self.s.telegram_owner_id:
+                return
+            msg = cb.get("message") or {}
+            chat_id, message_id = msg["chat"]["id"], msg["message_id"]
+            data = cb.get("data", "")
+
+            async def handle_cb() -> None:
+                toast = ""
+                if data.startswith("call:") and self.calls:
+                    toast = await self.calls.handle_button(chat_id, message_id, data)
+                await self.tg.answer_callback(cb["id"], toast)
+
+            self.spawn(handle_cb())
+            return
+
+        msg = update.get("message")
+        if not msg or not msg.get("text"):
+            return
+        if msg["from"]["id"] != self.s.telegram_owner_id:
+            log.warning("Ignoring message from non-owner %s", msg["from"]["id"])
+            return
+
+        chat_id, text = msg["chat"]["id"], msg["text"].strip()
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+
+        if self.calls and self.calls.resolve_owner_reply(text, reply_to):
+            self.spawn(self.tg.send_message(chat_id, "👍 Passed on to the call."))
+        elif text in ("/start", "/help"):
+            self.spawn(self.tg.send_message(chat_id, HELP))
+        elif text == "/reset":
+            self.db.clear_history(chat_id)
+            self.spawn(self.tg.send_message(chat_id, "Conversation cleared (memories and contacts kept)."))
+        elif text == "/memories":
+            mems = self.db.list_memories()
+            self.spawn(self.tg.send_message(chat_id, "\n".join(f"[{m['id']}] {m['text']}" for m in mems) or "No memories yet."))
+        else:
+            self.spawn(self.brain.handle_user_message(chat_id, text))
+
+    async def poll_telegram(self) -> None:
+        """Without a public URL, fetch messages from Telegram instead of receiving webhooks."""
+        offset = 0
+        while True:
+            try:
+                for update in await self.tg.get_updates(offset):
+                    offset = update["update_id"] + 1
+                    self.handle_update(update)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Telegram polling failed; retrying in 5s")
+                await asyncio.sleep(5)
 
     def spawn(self, coro: Any) -> None:
         """Run work in the background so webhooks return immediately."""
@@ -61,13 +118,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         s = settings or load_settings()
-        state["app"] = App(s)
-        try:
-            await state["app"].tg.set_webhook(f"{s.public_base_url}/telegram/webhook", s.telegram_webhook_secret)
-            log.info("Telegram webhook set to %s/telegram/webhook", s.public_base_url)
-        except Exception:
-            log.exception("Could not set Telegram webhook (is PUBLIC_BASE_URL reachable?)")
+        a = state["app"] = App(s)
+        poller: asyncio.Task[None] | None = None
+        if s.public_base_url:
+            try:
+                await a.tg.set_webhook(f"{s.public_base_url}/telegram/webhook", s.telegram_webhook_secret)
+                log.info("Telegram webhook set to %s/telegram/webhook", s.public_base_url)
+            except Exception:
+                log.exception("Could not set Telegram webhook (is PUBLIC_BASE_URL reachable?)")
+        else:
+            await a.tg.delete_webhook()
+            poller = asyncio.create_task(a.poll_telegram())
+            log.info("No PUBLIC_BASE_URL: polling Telegram for messages")
+        log.info(
+            "Brain: %s. Phone calls: %s. Web search: %s.",
+            a.brain.backend.provider,
+            "on" if a.calls else "off (needs PUBLIC_BASE_URL + Twilio + Retell)",
+            "on" if s.brave_api_key or s.brain_provider == "anthropic" else "off (no BRAVE_API_KEY)",
+        )
         yield
+        if poller:
+            poller.cancel()
 
     api = FastAPI(lifespan=lifespan)
 
@@ -85,56 +156,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         a = app()
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != a.s.telegram_webhook_secret:
             raise HTTPException(status_code=403)
-        update = await request.json()
-
-        if cb := update.get("callback_query"):
-            if cb["from"]["id"] != a.s.telegram_owner_id:
-                return {"ok": True}
-            msg = cb.get("message") or {}
-            chat_id, message_id = msg["chat"]["id"], msg["message_id"]
-            data = cb.get("data", "")
-
-            async def handle_cb() -> None:
-                toast = await a.calls.handle_button(chat_id, message_id, data) if data.startswith("call:") else ""
-                await a.tg.answer_callback(cb["id"], toast)
-
-            a.spawn(handle_cb())
-            return {"ok": True}
-
-        msg = update.get("message")
-        if not msg or not msg.get("text"):
-            return {"ok": True}
-        if msg["from"]["id"] != a.s.telegram_owner_id:
-            log.warning("Ignoring message from non-owner %s", msg["from"]["id"])
-            return {"ok": True}
-
-        chat_id, text = msg["chat"]["id"], msg["text"].strip()
-        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
-
-        if a.calls.resolve_owner_reply(text, reply_to):
-            a.spawn(a.tg.send_message(chat_id, "👍 Passed on to the call."))
-        elif text in ("/start", "/help"):
-            a.spawn(a.tg.send_message(chat_id, HELP))
-        elif text == "/reset":
-            a.db.clear_history(chat_id)
-            a.spawn(a.tg.send_message(chat_id, "Conversation cleared (memories and contacts kept)."))
-        elif text == "/memories":
-            mems = a.db.list_memories()
-            a.spawn(a.tg.send_message(chat_id, "\n".join(f"[{m['id']}] {m['text']}" for m in mems) or "No memories yet."))
-        else:
-            a.spawn(a.brain.handle_user_message(chat_id, text))
+        a.handle_update(await request.json())
         return {"ok": True}
 
     # --- Twilio -----------------------------------------------------------------
 
+    def calls() -> CallManager:
+        if app().calls is None:
+            raise HTTPException(status_code=404, detail="Phone calls are not configured")
+        return app().calls
+
     @api.post("/twilio/status/{call_id}")
     async def twilio_status(call_id: str, request: Request) -> dict[str, bool]:
         a = app()
+        manager = calls()
         form = dict(await request.form())
         url = f"{a.s.public_base_url}{request.url.path}"
         if not a.twilio_validator.validate(url, form, request.headers.get("X-Twilio-Signature", "")):
             raise HTTPException(status_code=403)
-        a.spawn(a.calls.handle_twilio_status(call_id, str(form.get("CallStatus", ""))))
+        a.spawn(manager.handle_twilio_status(call_id, str(form.get("CallStatus", ""))))
         return {"ok": True}
 
     # --- Retell -----------------------------------------------------------------
@@ -148,17 +188,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @api.post("/retell/webhook")
     async def retell_webhook(request: Request) -> dict[str, bool]:
+        manager = calls()
         payload = await _verified_retell_json(request)
-        app().spawn(app().calls.handle_retell_event(payload))
+        app().spawn(manager.handle_retell_event(payload))
         return {"ok": True}
 
     @api.post("/retell/ask-owner")
     async def retell_ask_owner(request: Request) -> dict[str, str]:
         """Retell custom function: the voice agent asks you something and waits for your reply."""
+        manager = calls()
         payload = await _verified_retell_json(request)
         call_id = (payload.get("call") or {}).get("call_id", "")
         question = (payload.get("args") or {}).get("question", "")
-        answer = await app().calls.ask_owner(call_id, question)
+        answer = await manager.ask_owner(call_id, question)
         return {"result": answer}
 
     return api

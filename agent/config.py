@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass
 
 
@@ -11,6 +12,12 @@ def _require(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def _optional(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    # Treat the .env.example placeholders as "not set yet"
+    return "" if value.endswith("...") or value.startswith("https://your-") else value
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,13 @@ class Settings:
     db_path: str
     ask_owner_timeout: int  # seconds the voice agent waits for your Telegram answer mid-call
 
+    @property
+    def calls_enabled(self) -> bool:
+        """Phone calls need Twilio + Retell, and a public URL for their webhooks."""
+        return all(
+            (self.public_base_url, self.twilio_account_sid, self.twilio_auth_token, self.retell_api_key, self.retell_agent_id)
+        )
+
 
 def load_settings() -> Settings:
     provider = os.environ.get("BRAIN_PROVIDER", "deepseek").strip().lower()
@@ -60,15 +74,16 @@ def load_settings() -> Settings:
         anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5"),
         telegram_bot_token=_require("TELEGRAM_BOT_TOKEN"),
         telegram_owner_id=int(_require("TELEGRAM_OWNER_ID")),
-        telegram_webhook_secret=_require("TELEGRAM_WEBHOOK_SECRET"),
-        public_base_url=_require("PUBLIC_BASE_URL").rstrip("/"),
+        telegram_webhook_secret=_optional("TELEGRAM_WEBHOOK_SECRET") or secrets.token_urlsafe(32),
+        # Empty = no public address: Telegram is polled instead, and calls stay off.
+        public_base_url=_optional("PUBLIC_BASE_URL").rstrip("/"),
         owner_name=_require("OWNER_NAME"),
         owner_phone=_require("OWNER_PHONE"),
         timezone=os.environ.get("OWNER_TIMEZONE", "Europe/Istanbul"),
-        twilio_account_sid=_require("TWILIO_ACCOUNT_SID"),
-        twilio_auth_token=_require("TWILIO_AUTH_TOKEN"),
-        retell_api_key=_require("RETELL_API_KEY"),
-        retell_agent_id=_require("RETELL_AGENT_ID"),
+        twilio_account_sid=_optional("TWILIO_ACCOUNT_SID"),
+        twilio_auth_token=_optional("TWILIO_AUTH_TOKEN"),
+        retell_api_key=_optional("RETELL_API_KEY"),
+        retell_agent_id=_optional("RETELL_AGENT_ID"),
         db_path=os.environ.get("DB_PATH", "agent.db"),
         ask_owner_timeout=int(os.environ.get("ASK_OWNER_TIMEOUT", "60")),
     )

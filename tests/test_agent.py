@@ -238,3 +238,43 @@ def test_fetch_url_blocks_private_hosts():
                     await web.fetch_url(http, url)
 
     asyncio.run(run())
+
+
+def test_chat_only_mode(tmp_path, monkeypatch):
+    """No public URL / Twilio / Retell: bot polls Telegram, calls are off, place_call is hidden."""
+    import dataclasses
+    from agent.main import App
+
+    s = dataclasses.replace(SETTINGS, public_base_url="", twilio_account_sid="", db_path=str(tmp_path / "a.db"))
+    assert not s.calls_enabled
+
+    async def run():
+        a = App(s)
+        assert a.calls is None
+        names = [t["name"] for t in a.brain._tools()]
+        assert "place_call" not in names and "fetch_url" in names
+        assert "not set up yet" in a.brain._system_prompt()
+
+        a.brain.handle_user_message = AsyncMock()
+        a.handle_update({"message": {"chat": {"id": 1}, "from": {"id": 999}, "message_id": 1, "text": "hi"}})
+        a.handle_update({"message": {"chat": {"id": 1}, "from": {"id": 1}, "message_id": 2, "text": "hello"}})
+        await asyncio.sleep(0)
+        a.brain.handle_user_message.assert_awaited_once_with(1, "hello")  # non-owner ignored
+
+    asyncio.run(run())
+
+
+def test_load_settings_minimal(monkeypatch):
+    from agent.config import load_settings
+
+    for k in list(__import__("os").environ):
+        if k.startswith(("TWILIO", "RETELL", "PUBLIC_BASE", "TELEGRAM", "DEEPSEEK", "BRAIN", "OWNER")):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_OWNER_ID", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
+    monkeypatch.setenv("OWNER_NAME", "Eray")
+    monkeypatch.setenv("OWNER_PHONE", "+905321234567")
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC...")  # untouched placeholder counts as empty
+    s = load_settings()
+    assert s.brain_provider == "deepseek" and not s.calls_enabled and s.telegram_webhook_secret
