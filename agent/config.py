@@ -15,7 +15,13 @@ def _require(name: str) -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    # Claude
+    # Brain (Telegram chats): "deepseek" or "anthropic"
+    brain_provider: str
+    deepseek_api_key: str
+    deepseek_base_url: str
+    deepseek_model: str
+    deepseek_reasoning_effort: str
+    brave_api_key: str  # optional: web search for DeepSeek (Claude has its own)
     anthropic_model: str
     # Telegram
     telegram_bot_token: str
@@ -39,8 +45,19 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    provider = os.environ.get("BRAIN_PROVIDER", "deepseek").strip().lower()
+    if provider not in ("deepseek", "anthropic"):
+        raise RuntimeError("BRAIN_PROVIDER must be 'deepseek' or 'anthropic'")
+    if provider == "anthropic":
+        _require("ANTHROPIC_API_KEY")  # read by the Anthropic SDK itself
     return Settings(
-        anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-5"),
+        brain_provider=provider,
+        deepseek_api_key=_require("DEEPSEEK_API_KEY") if provider == "deepseek" else "",
+        deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+        deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        deepseek_reasoning_effort=os.environ.get("DEEPSEEK_REASONING_EFFORT", "none"),
+        brave_api_key=os.environ.get("BRAVE_API_KEY", "").strip(),
+        anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5"),
         telegram_bot_token=_require("TELEGRAM_BOT_TOKEN"),
         telegram_owner_id=int(_require("TELEGRAM_OWNER_ID")),
         telegram_webhook_secret=_require("TELEGRAM_WEBHOOK_SECRET"),

@@ -4,10 +4,10 @@ A personal assistant you text on Telegram. It does everyday tasks for you and ca
 from your own number**.
 
 ```
-You (Telegram) ──▶ this server ──▶ Claude (brain: tools, memory, web search)
+You (Telegram) ──▶ this server ──▶ Brain: DeepSeek V4-Flash or Claude (tools, memory, web search)
                                      │
                                      └─ place_call ─▶ you tap ✅ ─▶ Twilio dials, showing YOUR number
-                                                                     └─▶ Retell voice AI talks
+                                                                     └─▶ Retell voice AI talks (Claude Haiku 4.5)
                                                                            ├─ ask_owner ─▶ texts you mid-call
                                                                            └─ transcript ─▶ Claude ─▶ summary to you
 ```
@@ -30,7 +30,10 @@ you and you type in the code. This needs an upgraded (paid) Twilio account.
 ## Setup
 
 ### 1. Accounts
-- **Anthropic:** API key (console.anthropic.com)
+- **Brain model:** a DeepSeek key (platform.deepseek.com, the same one Reservay uses) by default.
+  To use Claude instead, set `BRAIN_PROVIDER=anthropic` and add an Anthropic key. Switching is one line
+  in `.env` and starts a fresh conversation.
+- **Web search for DeepSeek (optional):** a Brave Search API key. Claude has web search built in.
 - **Telegram:** create a bot with [@BotFather](https://t.me/BotFather) to get a token. Get your numeric
   user id from [@userinfobot](https://t.me/userinfobot).
 - **Twilio:** upgraded account, your number verified as a caller ID, and voice calling to your target

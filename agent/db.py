@@ -52,15 +52,19 @@ class DB:
 
     # --- conversation history -------------------------------------------------
 
-    def get_history(self, chat_id: int) -> list[dict[str, Any]]:
+    def get_history(self, chat_id: int, provider: str) -> list[dict[str, Any]]:
+        """Messages are stored in the provider's own format; another provider starts fresh."""
         row = self.conn.execute("SELECT messages FROM history WHERE chat_id = ?", (chat_id,)).fetchone()
-        return json.loads(row["messages"]) if row else []
+        if not row:
+            return []
+        stored = json.loads(row["messages"])
+        return stored["messages"] if stored.get("provider") == provider else []
 
-    def save_history(self, chat_id: int, messages: list[dict[str, Any]]) -> None:
+    def save_history(self, chat_id: int, provider: str, messages: list[dict[str, Any]]) -> None:
         self.conn.execute(
             "INSERT INTO history (chat_id, messages) VALUES (?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET messages = excluded.messages",
-            (chat_id, json.dumps(messages)),
+            (chat_id, json.dumps({"provider": provider, "messages": messages})),
         )
         self.conn.commit()
 

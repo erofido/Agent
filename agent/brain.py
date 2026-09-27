@@ -1,4 +1,4 @@
-"""The agent's brain: a Claude tool-use loop with per-chat history."""
+"""The agent's brain: tools, memory and per-chat history on top of a model backend (see llm.py)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
-import anthropic
+import httpx
 
+from . import web
 from .config import Settings
 from .db import DB
+from .llm import AnthropicBackend, Backend, OpenAICompatBackend, Refused
 from .telegram import Telegram
 
 if TYPE_CHECKING:
@@ -21,9 +23,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-MAX_STEPS = 25  # safety cap on tool-use iterations per turn
 MAX_HISTORY_MESSAGES = 60
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
 E164 = re.compile(r"^\+[1-9]\d{6,14}$")
 
 SYSTEM_PROMPT = """\
@@ -52,8 +52,6 @@ preferences, appointments). Things you already know:
 """
 
 TOOLS: list[dict[str, Any]] = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
-    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 5},
     {
         "name": "place_call",
         "description": (
@@ -140,13 +138,42 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+# Only offered to backends without built-in web tools (DeepSeek); Claude uses its own.
+WEB_SEARCH_TOOL: dict[str, Any] = {
+    "name": "web_search",
+    "description": "Search the web. Returns titles, URLs and snippets of the top results.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+FETCH_URL_TOOL: dict[str, Any] = {
+    "name": "fetch_url",
+    "description": "Fetch a web page and return its text, e.g. to read a business's opening hours or phone number.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"],
+        "additionalProperties": False,
+    },
+}
+
+
+def make_backend(s: Settings) -> Backend:
+    if s.brain_provider == "anthropic":
+        return AnthropicBackend(s.anthropic_model)
+    return OpenAICompatBackend(s.deepseek_model, s.deepseek_base_url, s.deepseek_api_key, s.deepseek_reasoning_effort)
+
 
 class Brain:
-    def __init__(self, settings: Settings, db: DB, telegram: Telegram, client: anthropic.AsyncAnthropic | None = None):
+    def __init__(self, settings: Settings, db: DB, telegram: Telegram, backend: Backend | None = None):
         self.s = settings
         self.db = db
         self.tg = telegram
-        self.client = client or anthropic.AsyncAnthropic()
+        self.backend = backend or make_backend(settings)
+        self.http = httpx.AsyncClient(timeout=20)
         self.calls: CallManager | None = None  # wired up in main.py
         self._locks: dict[int, asyncio.Lock] = {}
 
@@ -164,64 +191,43 @@ class Brain:
     async def _run_turn(self, chat_id: int, user_content: str) -> None:
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
-            history = self.db.get_history(chat_id)
+            provider = self.backend.provider
+            history = self.db.get_history(chat_id, provider)  # empty after switching provider
             snapshot = list(history)
             history.append({"role": "user", "content": user_content})
             try:
                 await self.tg.send_typing(chat_id)
-                reply = await self._loop(chat_id, history)
-            except anthropic.APIError as exc:
-                log.exception("Claude API error")
-                self.db.save_history(chat_id, snapshot)
-                await self.tg.send_message(chat_id, f"⚠️ I hit an error talking to Claude: {exc.__class__.__name__}. Try again?")
-                return
-            if reply is None:  # refusal: roll back so the conversation stays valid
-                self.db.save_history(chat_id, snapshot)
+                reply = await self.backend.run(self._system_prompt(), history, self._tools(), self._tool_runner(chat_id))
+            except Refused:
+                self.db.save_history(chat_id, provider, snapshot)  # roll back so the conversation stays valid
                 await self.tg.send_message(chat_id, "I can't help with that one.")
                 return
-            self.db.save_history(chat_id, _trim(history))
+            except self.backend.api_errors as exc:
+                log.exception("Model API error")
+                self.db.save_history(chat_id, provider, snapshot)
+                await self.tg.send_message(chat_id, f"⚠️ I hit an error talking to the AI ({exc.__class__.__name__}). Try again?")
+                return
+            self.db.save_history(chat_id, provider, _trim(history))
             if reply.strip():
                 await self.tg.send_message(chat_id, reply)
 
-    async def _loop(self, chat_id: int, history: list[dict[str, Any]]) -> str | None:
-        system = SYSTEM_PROMPT.format(
+    def _system_prompt(self) -> str:
+        return SYSTEM_PROMPT.format(
             owner_name=self.s.owner_name,
             owner_phone=self.s.owner_phone,
             memories="\n".join(f"- [{m['id']}] {m['text']}" for m in self.db.list_memories()) or "- (nothing yet)",
         )
-        for _ in range(MAX_STEPS):
-            response = await self.client.beta.messages.create(
-                model=self.s.anthropic_model,
-                max_tokens=16000,
-                system=system,
-                tools=TOOLS,
-                messages=history,
-                thinking={"type": "adaptive"},
-                cache_control={"type": "ephemeral"},
-                betas=[FALLBACK_BETA],
-                fallbacks="default",
-            )
-            if response.stop_reason == "refusal":
-                return None
-            history.append({"role": "assistant", "content": [b.to_dict(mode="json") for b in response.content]})
 
-            if response.stop_reason == "pause_turn":
-                continue  # server tool (web search) paused mid-turn; resend to resume
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            if response.stop_reason != "tool_use" or not tool_uses:
-                return "".join(b.text for b in response.content if b.type == "text")
+    def _tools(self) -> list[dict[str, Any]]:
+        if self.backend.provider == "anthropic":
+            return TOOLS
+        return [*TOOLS, *([WEB_SEARCH_TOOL] if self.s.brave_api_key else []), FETCH_URL_TOOL]
 
-            results = await asyncio.gather(*(self._run_tool(chat_id, b.name, b.input) for b in tool_uses))
-            history.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "tool_result", "tool_use_id": b.id, "content": out, "is_error": err}
-                        for b, (out, err) in zip(tool_uses, results)
-                    ],
-                }
-            )
-        return "I stopped after too many steps — tell me how you'd like to continue."
+    def _tool_runner(self, chat_id: int):
+        async def run(name: str, args: Any) -> tuple[str, bool]:
+            return await self._run_tool(chat_id, name, args)
+
+        return run
 
     # --- tools -----------------------------------------------------------------
 
@@ -262,6 +268,10 @@ class Brain:
             return json.dumps([dict(r) for r in rows]) if rows else "No matching contacts."
         if name == "remember":
             return f"Remembered (id {self.db.add_memory(a['fact'])})."
+        if name == "web_search" and self.s.brave_api_key:
+            return await web.brave_search(self.http, self.s.brave_api_key, a["query"])
+        if name == "fetch_url":
+            return await web.fetch_url(self.http, a["url"])
         if name == "forget":
             return "Deleted." if self.db.delete_memory(int(a["memory_id"])) else "No memory with that id."
         raise ValueError(f"Unknown tool {name}")

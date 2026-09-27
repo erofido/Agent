@@ -5,11 +5,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent.brain import Brain, _trim
+from agent.llm import AnthropicBackend, OpenAICompatBackend
 from agent.calls import CallManager
 from agent.config import Settings
 from agent.db import DB
 
 SETTINGS = Settings(
+    brain_provider="deepseek",
+    deepseek_api_key="sk-test",
+    deepseek_base_url="https://api.deepseek.com/v1",
+    deepseek_model="deepseek-v4-flash",
+    deepseek_reasoning_effort="none",
+    brave_api_key="",
     anthropic_model="claude-opus-5",
     telegram_bot_token="t",
     telegram_owner_id=1,
@@ -130,7 +137,7 @@ def test_ask_owner_answer_and_timeout(tmp_path):
     asyncio.run(run())
 
 
-def test_brain_tool_loop(tmp_path):
+def test_anthropic_backend_tool_loop(tmp_path):
     async def run():
         db, tg, calls, _ = make(tmp_path)
         client = MagicMock()
@@ -145,15 +152,66 @@ def test_brain_tool_loop(tmp_path):
                 SimpleNamespace(stop_reason="end_turn", content=[text_block]),
             ]
         )
-        brain = Brain(SETTINGS, db, tg, client=client)
+        brain = Brain(SETTINGS, db, tg, backend=AnthropicBackend("claude-opus-5", client=client))
         brain.calls = calls
         await brain.handle_user_message(7, "remember my plate")
         assert [m["text"] for m in db.list_memories()] == ["plate 34 ABC 123"]
         tg.send_message.assert_awaited_with(7, "Saved!")
-        hist = db.get_history(7)
+        hist = db.get_history(7, "anthropic")
         assert hist[2]["content"][0]["type"] == "tool_result"
+        assert db.get_history(7, "deepseek") == []  # other provider starts fresh
         kwargs = client.beta.messages.create.call_args.kwargs
         assert kwargs["fallbacks"] == "default" and kwargs["thinking"] == {"type": "adaptive"}
+        assert kwargs["tools"][0]["type"] == "web_search_20260209"
+
+    asyncio.run(run())
+
+
+def _oai_response(content=None, tool_calls=None, finish="stop"):
+    msg = SimpleNamespace(content=content, tool_calls=tool_calls, reasoning_content=None)
+    return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=finish)])
+
+
+def test_deepseek_backend_tool_loop(tmp_path):
+    async def run():
+        db, tg, calls, _ = make(tmp_path)
+        client = MagicMock()
+        call = SimpleNamespace(
+            id="c1", type="function",
+            function=SimpleNamespace(name="save_contact", arguments='{"name": "Luigi\'s", "phone": "+902161234567"}'),
+        )
+        client.chat.completions.create = AsyncMock(
+            side_effect=[_oai_response(tool_calls=[call], finish="tool_calls"), _oai_response(content="Saved Luigi's.")]
+        )
+        backend = OpenAICompatBackend("deepseek-v4-flash", "https://x", "k", client=client)
+        brain = Brain(SETTINGS, db, tg, backend=backend)
+        brain.calls = calls
+        await brain.handle_user_message(7, "save luigi +902161234567")
+
+        assert db.find_contacts("luigi")[0]["phone"] == "+902161234567"
+        tg.send_message.assert_awaited_with(7, "Saved Luigi's.")
+        hist = db.get_history(7, "deepseek")
+        assert [m["role"] for m in hist] == ["user", "assistant", "tool", "assistant"]
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "none"
+        assert kwargs["messages"][0]["role"] == "system"
+        names = [t["function"]["name"] for t in kwargs["tools"]]
+        assert "place_call" in names and "fetch_url" in names and "web_search" not in names  # no Brave key
+
+    asyncio.run(run())
+
+
+def test_api_error_rolls_back(tmp_path):
+    async def run():
+        import httpx, openai
+        db, tg, calls, _ = make(tmp_path)
+        client = MagicMock()
+        req = httpx.Request("POST", "https://x")
+        client.chat.completions.create = AsyncMock(side_effect=openai.APIConnectionError(request=req))
+        brain = Brain(SETTINGS, db, tg, backend=OpenAICompatBackend("m", "https://x", "k", client=client))
+        await brain.handle_user_message(7, "hi")
+        assert db.get_history(7, "deepseek") == []
+        assert "error" in tg.send_message.call_args.args[1]
 
     asyncio.run(run())
 
@@ -161,9 +219,22 @@ def test_brain_tool_loop(tmp_path):
 def test_place_call_rejects_bad_number(tmp_path):
     async def run():
         db, tg, calls, _ = make(tmp_path)
-        brain = Brain(SETTINGS, db, tg, client=MagicMock())
+        brain = Brain(SETTINGS, db, tg, backend=OpenAICompatBackend("m", "https://x", "k", client=MagicMock()))
         brain.calls = calls
         out, err = await brain._run_tool(7, "place_call", {"to_number": "0532 123", "contact_name": "x", "goal": "g", "brief": "b", "language": "en"})
         assert err and "E.164" in out
+
+    asyncio.run(run())
+
+
+def test_fetch_url_blocks_private_hosts():
+    import httpx
+    from agent import web
+
+    async def run():
+        async with httpx.AsyncClient() as http:
+            for url in ("http://127.0.0.1:8000/", "http://169.254.169.254/latest", "file:///etc/passwd"):
+                with pytest.raises(ValueError):
+                    await web.fetch_url(http, url)
 
     asyncio.run(run())
