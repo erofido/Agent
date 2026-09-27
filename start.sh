@@ -18,5 +18,4 @@ if [ ! -d .venv ]; then
 fi
 . .venv/bin/activate
 pip install -q --disable-pip-version-check -r requirements.txt
-set -a; . ./.env; set +a
-exec uvicorn agent.main:app --port 8000
+exec uvicorn agent.main:app --port 8000 --env-file .env

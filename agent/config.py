@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _require(name: str) -> str:
@@ -58,6 +59,18 @@ class Settings:
         )
 
 
+def _timezone() -> str:
+    tz = os.environ.get("OWNER_TIMEZONE", "").strip() or "Europe/Istanbul"
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise RuntimeError(
+            f"OWNER_TIMEZONE={tz!r} is not a valid timezone. Use a name like Europe/London, "
+            "Europe/Istanbul or Europe/Berlin."
+        ) from None
+    return tz
+
+
 def load_settings() -> Settings:
     provider = os.environ.get("BRAIN_PROVIDER", "deepseek").strip().lower()
     if provider not in ("deepseek", "anthropic"):
@@ -79,7 +92,7 @@ def load_settings() -> Settings:
         public_base_url=_optional("PUBLIC_BASE_URL").rstrip("/"),
         owner_name=_require("OWNER_NAME"),
         owner_phone=_require("OWNER_PHONE"),
-        timezone=os.environ.get("OWNER_TIMEZONE", "Europe/Istanbul"),
+        timezone=_timezone(),
         twilio_account_sid=_optional("TWILIO_ACCOUNT_SID"),
         twilio_auth_token=_optional("TWILIO_AUTH_TOKEN"),
         retell_api_key=_optional("RETELL_API_KEY"),

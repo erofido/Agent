@@ -278,3 +278,13 @@ def test_load_settings_minimal(monkeypatch):
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "AC...")  # untouched placeholder counts as empty
     s = load_settings()
     assert s.brain_provider == "deepseek" and not s.calls_enabled and s.telegram_webhook_secret
+
+
+def test_bad_timezone_message(monkeypatch):
+    from agent.config import _timezone
+
+    monkeypatch.setenv("OWNER_TIMEZONE", "United Kingdom/London")
+    with pytest.raises(RuntimeError, match="Europe/London"):
+        _timezone()
+    monkeypatch.setenv("OWNER_TIMEZONE", "Europe/London")
+    assert _timezone() == "Europe/London"

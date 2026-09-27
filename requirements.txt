@@ -6,3 +6,4 @@ twilio>=9.0
 retell-sdk>=6.0
 python-multipart>=0.0.9
 openai>=1.50
+python-dotenv>=1.0
