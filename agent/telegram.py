@@ -56,6 +56,13 @@ class Telegram:
     async def send_typing(self, chat_id: int) -> None:
         await self._call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
+    async def get_me(self) -> dict[str, Any]:
+        return await self._call("getMe", {})
+
+    async def get_chat_member_status(self, chat_id: int, user_id: int) -> str:
+        result = await self._call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+        return str(result.get("status", ""))
+
     async def get_updates(self, offset: int, timeout: int = 30) -> list[dict[str, Any]]:
         resp = await self.http.post(
             f"{self.base}/getUpdates",

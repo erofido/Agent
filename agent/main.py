@@ -18,6 +18,7 @@ from .brain import Brain
 from .calls import CallManager
 from .config import Settings, load_settings
 from .db import DB
+from .groups import GroupChats
 from .telegram import Telegram
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -26,8 +27,12 @@ log = logging.getLogger("agent")
 HELP = (
     "Hi! Just tell me what you need, e.g.\n"
     "• “Call Luigi's and book a table for 4 on Friday 20:00”\n"
-    "• “Remember my dentist is Dr. Yilmaz, +90 212 …”\n\n"
-    "Commands: /reset (forget this conversation), /memories"
+    "• “Remember my dentist is Dr. Yilmaz, +90 212 …”\n"
+    "• “What did the London group decide about the hotel?”\n\n"
+    "Commands:\n"
+    "/ru <text> – translate your message into Russian to paste in a group\n"
+    "/reset – forget this conversation\n"
+    "/memories – what I remember about you"
 )
 
 
@@ -41,6 +46,9 @@ class App:
         if settings.calls_enabled:
             self.calls = CallManager(settings, self.db, self.tg, on_event=self.brain.handle_event)
             self.brain.calls = self.calls
+        self.groups = GroupChats(
+            settings, self.db, self.tg, self.brain.backend, self.brain, summary_seconds=settings.group_summary_seconds
+        )
         self.twilio_validator = RequestValidator(settings.twilio_auth_token)
         self._tasks: set[asyncio.Task[Any]] = set()
 
@@ -63,7 +71,12 @@ class App:
             return
 
         msg = update.get("message")
-        if not msg or not msg.get("text"):
+        if not msg:
+            return
+        if msg["chat"].get("type") in ("group", "supergroup"):
+            self.spawn(self.groups.handle(msg))  # anyone in the group can chat; never the personal brain
+            return
+        if not msg.get("text") or msg["chat"].get("type", "private") != "private":
             return
         if msg["from"]["id"] != self.s.telegram_owner_id:
             log.warning("Ignoring message from non-owner %s", msg["from"]["id"])
@@ -74,6 +87,8 @@ class App:
 
         if self.calls and self.calls.resolve_owner_reply(text, reply_to):
             self.spawn(self.tg.send_message(chat_id, "👍 Passed on to the call."))
+        elif text.startswith("/ru"):
+            self.spawn(self._translate(chat_id, text[3:].strip()))
         elif text in ("/start", "/help"):
             self.spawn(self.tg.send_message(chat_id, HELP))
         elif text == "/reset":
@@ -84,6 +99,18 @@ class App:
             self.spawn(self.tg.send_message(chat_id, "\n".join(f"[{m['id']}] {m['text']}" for m in mems) or "No memories yet."))
         else:
             self.spawn(self.brain.handle_user_message(chat_id, text))
+
+    async def _translate(self, chat_id: int, text: str) -> None:
+        if not text:
+            await self.tg.send_message(chat_id, "Send /ru followed by what you want to say, e.g. /ru Who is booking the hotel?")
+            return
+        try:
+            russian = await self.groups.translate_to_russian(text)
+        except Exception:
+            log.exception("Translation failed")
+            await self.tg.send_message(chat_id, "⚠️ Translation failed, try again?")
+            return
+        await self.tg.send_message(chat_id, russian)
 
     async def poll_telegram(self) -> None:
         """Without a public URL, fetch messages from Telegram instead of receiving webhooks."""
@@ -120,6 +147,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s = settings or load_settings()
         a = state["app"] = App(s)
         poller: asyncio.Task[None] | None = None
+        try:
+            await a.groups.start()
+        except Exception:
+            log.exception("Could not read the bot's own Telegram profile (getMe)")
+        summaries = asyncio.create_task(a.groups.summary_loop())
         if s.public_base_url:
             try:
                 await a.tg.set_webhook(f"{s.public_base_url}/telegram/webhook", s.telegram_webhook_secret)
@@ -137,6 +169,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "on" if s.brave_api_key or s.brain_provider == "anthropic" else "off (no BRAVE_API_KEY)",
         )
         yield
+        summaries.cancel()
         if poller:
             poller.cancel()
 

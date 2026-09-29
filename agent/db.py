@@ -24,6 +24,16 @@ CREATE TABLE IF NOT EXISTS contacts (
     phone TEXT NOT NULL,
     notes TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS group_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    chat_title TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    text TEXT NOT NULL,
+    sent_at REAL NOT NULL,
+    summarized INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS group_messages_pending ON group_messages (summarized, chat_id);
 CREATE TABLE IF NOT EXISTS calls (
     id TEXT PRIMARY KEY,
     chat_id INTEGER NOT NULL,
@@ -110,6 +120,43 @@ class DB:
             "WHERE lower(name) LIKE ? OR lower(notes) LIKE ? OR phone LIKE ? ORDER BY name",
             (like, like, like),
         ).fetchall()
+
+    # --- group chats ------------------------------------------------------------
+
+    def add_group_message(
+        self, chat_id: int, chat_title: str, sender: str, text: str, sent_at: float, summarized: bool = False
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO group_messages (chat_id, chat_title, sender, text, sent_at, summarized) VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, chat_title, sender, text, sent_at, int(summarized)),
+        )
+        self.conn.commit()
+
+    def pending_group_chats(self) -> list[int]:
+        rows = self.conn.execute("SELECT DISTINCT chat_id FROM group_messages WHERE summarized = 0").fetchall()
+        return [r["chat_id"] for r in rows]
+
+    def group_messages(self, chat_id: int, *, summarized: bool | None = None, limit: int = 200) -> list[sqlite3.Row]:
+        """Newest `limit` messages, returned oldest first. summarized=None means both kinds."""
+        where, args = "chat_id = ?", [chat_id]
+        if summarized is not None:
+            where += " AND summarized = ?"
+            args.append(int(summarized))
+        rows = self.conn.execute(
+            f"SELECT id, chat_title, sender, text, sent_at FROM group_messages WHERE {where} ORDER BY id DESC LIMIT ?",
+            (*args, limit),
+        ).fetchall()
+        return list(reversed(rows))
+
+    def mark_summarized(self, ids: list[int]) -> None:
+        self.conn.executemany("UPDATE group_messages SET summarized = 1 WHERE id = ?", [(i,) for i in ids])
+        self.conn.commit()
+
+    def recent_group_messages(self, limit: int = 150) -> list[sqlite3.Row]:
+        rows = self.conn.execute(
+            "SELECT chat_title, sender, text, sent_at FROM group_messages ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return list(reversed(rows))
 
     # --- calls ----------------------------------------------------------------
 

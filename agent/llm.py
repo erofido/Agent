@@ -39,6 +39,10 @@ class Backend(Protocol):
         self, system: str, history: list[dict[str, Any]], tools: list[dict[str, Any]], run_tool: ToolRunner
     ) -> str: ...
 
+    async def complete(self, system: str, prompt: str) -> str:
+        """One-shot text answer, no tools (summaries, translations)."""
+        ...
+
 
 # --- Claude ---------------------------------------------------------------------
 
@@ -94,6 +98,18 @@ class AnthropicBackend:
                 }
             )
         return STEP_LIMIT_REPLY
+
+    async def complete(self, system, prompt):
+        response = await self.client.beta.messages.create(
+            model=self.model,
+            max_tokens=8000,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+            thinking={"type": "adaptive"},
+        )
+        if response.stop_reason == "refusal":
+            raise Refused()
+        return "".join(b.text for b in response.content if b.type == "text")
 
 
 # --- DeepSeek / OpenAI-compatible -----------------------------------------------
@@ -158,6 +174,19 @@ class OpenAICompatBackend:
             for c, (out, err) in zip(calls, results):
                 history.append({"role": "tool", "tool_call_id": c.id, "content": out})
         return STEP_LIMIT_REPLY
+
+    async def complete(self, system, prompt):
+        extra = {} if self.reasoning_effort == "default" else {"reasoning_effort": self.reasoning_effort}
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=4000,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            **extra,
+        )
+        choice = response.choices[0]
+        if choice.finish_reason == "content_filter":
+            raise Refused()
+        return choice.message.content or ""
 
 
 def _parse_args(raw: str | None) -> Any:

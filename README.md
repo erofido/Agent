@@ -61,6 +61,18 @@ fly launch --no-deploy && fly volumes create data --size 1
 fly secrets set $(grep -v '^#' .env | xargs) && fly deploy
 ```
 
+## Group chats (e.g. a trip group in another language)
+Add the bot to a Telegram group you're in. It joins **openly as a bot**:
+- It answers when someone **@mentions it or replies to it**, in their language, and can search the web.
+  Group members can only chat with it. Calls, memories and contacts stay yours.
+- Every `GROUP_SUMMARY_SECONDS` (default 60) you get a private **English summary** of new messages.
+- `/ru <text>` in your private chat gives you Russian to paste into the group yourself.
+- Ask it privately: "What did the London group decide about the hotel?"
+
+Before adding it, turn off privacy mode so it can read all group messages: in @BotFather send
+`/setprivacy`, pick your bot, choose **Disable**. If it's already in the group, remove it and add it again.
+The bot ignores groups you're not a member of.
+
 ## Example commands
 - "Call Luigi's in Kadıköy and book a table for 4 this Friday around 20:00, anything 19:00–21:00 works."
 - "Call my dentist and move Thursday's appointment to next week, mornings only."

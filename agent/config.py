@@ -50,6 +50,7 @@ class Settings:
     # Misc
     db_path: str
     ask_owner_timeout: int  # seconds the voice agent waits for your Telegram answer mid-call
+    group_summary_seconds: int = 60  # how often you get English summaries of group chats
 
     @property
     def calls_enabled(self) -> bool:
@@ -99,4 +100,5 @@ def load_settings() -> Settings:
         retell_agent_id=_optional("RETELL_AGENT_ID"),
         db_path=os.environ.get("DB_PATH", "agent.db"),
         ask_owner_timeout=int(os.environ.get("ASK_OWNER_TIMEOUT", "60")),
+        group_summary_seconds=max(15, int(os.environ.get("GROUP_SUMMARY_SECONDS", "60"))),
     )

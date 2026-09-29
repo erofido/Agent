@@ -78,6 +78,18 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "read_group_chats",
+        "description": (
+            "Read the latest messages from the Telegram group chats the bot is in (e.g. the London trip group), "
+            "to answer the owner's questions about them. Messages may be in Russian; answer the owner in their language."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "How many recent messages (default 150, max 400)"}},
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "list_recent_calls",
         "description": "List the most recent calls with their status and summary.",
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -257,6 +269,15 @@ class Brain:
                 chat_id, number, a["contact_name"], a["goal"], a["brief"], a["language"]
             )
             return f"Approval requested from the owner (call id {call_id}). The outcome will arrive as an event."
+        if name == "read_group_chats":
+            rows = self.db.recent_group_messages(min(int(a.get("limit") or 150), 400))
+            if not rows:
+                return "No group messages yet. The bot must be added to a group (with privacy mode off)."
+            zone = ZoneInfo(self.s.timezone)
+            return "\n".join(
+                f"[{r['chat_title']} | {datetime.fromtimestamp(r['sent_at'], zone):%d %b %H:%M}] {r['sender']}: {r['text']}"
+                for r in rows
+            )
         if name == "list_recent_calls":
             rows = self.db.recent_calls()
             return json.dumps([dict(r) for r in rows], default=str) if rows else "No calls yet."

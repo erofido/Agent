@@ -288,3 +288,112 @@ def test_bad_timezone_message(monkeypatch):
         _timezone()
     monkeypatch.setenv("OWNER_TIMEZONE", "Europe/London")
     assert _timezone() == "Europe/London"
+
+
+def _group_app(tmp_path, owner_status="member"):
+    import dataclasses
+    from agent.main import App
+
+    s = dataclasses.replace(SETTINGS, public_base_url="", twilio_account_sid="", db_path=str(tmp_path / "g.db"))
+    a = App(s)
+    a.tg.send_message = AsyncMock(return_value=77)
+    a.tg.send_typing = AsyncMock()
+    a.tg.get_chat_member_status = AsyncMock(return_value=owner_status)
+    a.groups.bot_id, a.groups.bot_username, a.groups.bot_name = 555, "eray_helper_bot", "Helper"
+    a.brain.backend.run = AsyncMock(return_value="Привет! Биг-Бен рядом с Вестминстером.")
+    a.brain.backend.complete = AsyncMock(return_value="- Anna: hotel booked for 3 nights")
+    return a
+
+
+def _gmsg(text, sender_id=42, first="Anna", reply_to_bot=False, chat_id=-100):
+    m = {"chat": {"id": chat_id, "type": "supergroup", "title": "London trip"}, "from": {"id": sender_id, "first_name": first},
+         "message_id": 10, "date": 1790000000, "text": text}
+    if reply_to_bot:
+        m["reply_to_message"] = {"from": {"id": 555}}
+    return m
+
+
+def test_group_records_and_replies_only_when_addressed(tmp_path):
+    async def run():
+        a = _group_app(tmp_path)
+        await a.groups.handle(_gmsg("Кто бронирует отель?"))
+        a.brain.backend.run.assert_not_awaited()  # not addressed to the bot: just recorded
+        await a.groups.handle(_gmsg("@eray_helper_bot где Биг-Бен?"))
+        await a.groups.handle(_gmsg("а сколько стоит?", reply_to_bot=True))
+        assert a.brain.backend.run.await_count == 2
+        chat_id, text = a.tg.send_message.call_args.args
+        assert chat_id == -100 and "Биг-Бен" in text and a.tg.send_message.call_args.kwargs["reply_to"] == 10
+        system, history, tools, runner = a.brain.backend.run.call_args.args
+        assert "bot" in system and "Кто бронирует отель?" in history[0]["content"]  # context included
+        assert {t["name"] for t in tools} <= {"web_search", "fetch_url"}  # no calls/memories for the group
+        out, err = await runner("place_call", {"to_number": "+441234567890"})
+        assert err and "not available" in out
+        senders = [r["sender"] for r in a.db.group_messages(-100)]
+        assert senders.count("Anna") == 3 and "Helper (bot)" in senders
+
+    asyncio.run(run())
+
+
+def test_group_ignored_when_owner_not_member(tmp_path):
+    async def run():
+        a = _group_app(tmp_path, owner_status="left")
+        await a.groups.handle(_gmsg("@eray_helper_bot hi"))
+        a.brain.backend.run.assert_not_awaited()
+        assert a.db.group_messages(-100) == []
+
+    asyncio.run(run())
+
+
+def test_group_rate_limit(tmp_path):
+    from agent import groups
+
+    async def run():
+        a = _group_app(tmp_path)
+        for _ in range(groups.MAX_REPLIES_PER_MINUTE + 3):
+            await a.groups.handle(_gmsg("@eray_helper_bot ?"))
+        assert a.brain.backend.run.await_count == groups.MAX_REPLIES_PER_MINUTE
+
+    asyncio.run(run())
+
+
+def test_group_summary_sent_to_owner_once(tmp_path):
+    async def run():
+        a = _group_app(tmp_path)
+        await a.groups.handle(_gmsg("Я забронировала отель на 3 ночи"))
+        await a.groups.handle(_gmsg("Эрай, ты прилетаешь в пятницу?", sender_id=43, first="Oleg"))
+        await a.groups.send_summaries()
+        chat_id, text = a.tg.send_message.call_args.args
+        assert chat_id == SETTINGS.telegram_owner_id and "London trip (2 new)" in text and "hotel" in text
+        prompt = a.brain.backend.complete.call_args.args[1]
+        assert "Oleg: Эрай" in prompt
+        a.tg.send_message.reset_mock()
+        await a.groups.send_summaries()  # nothing new -> no message
+        a.tg.send_message.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_private_routing_ru_and_group_owner(tmp_path):
+    async def run():
+        a = _group_app(tmp_path)
+        a.brain.backend.complete = AsyncMock(return_value="Кто бронирует отель?")
+        a.brain.handle_user_message = AsyncMock()
+        a.handle_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}, "message_id": 1, "text": "/ru Who books the hotel?"}})
+        # the owner writing in the group goes to the group logic, never the personal brain
+        a.handle_update({"message": _gmsg("hello all", sender_id=1, first="Eray")})
+        await asyncio.sleep(0.05)
+        a.tg.send_message.assert_awaited_with(1, "Кто бронирует отель?")
+        a.brain.handle_user_message.assert_not_awaited()
+        assert a.db.group_messages(-100)[0]["sender"] == "Eray (owner)"
+
+    asyncio.run(run())
+
+
+def test_read_group_chats_tool(tmp_path):
+    async def run():
+        a = _group_app(tmp_path)
+        await a.groups.handle(_gmsg("Отель на Кингс-Кросс"))
+        out, err = await a.brain._run_tool(1, "read_group_chats", {})
+        assert not err and "London trip" in out and "Anna: Отель" in out
+
+    asyncio.run(run())
