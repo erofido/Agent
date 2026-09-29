@@ -22,6 +22,9 @@ from .groups import GroupChats
 from .telegram import Telegram
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# HTTP client request logs include full URLs, and Telegram's contain the bot token. Keep them out of the log.
+for _noisy in ("httpx", "httpx2", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("agent")
 
 HELP = (
